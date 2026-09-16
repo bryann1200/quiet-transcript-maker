@@ -62,14 +62,6 @@ function formatTime(totalSeconds: number) {
   return `${minutes}:${seconds}`;
 }
 
-function audioToBase64(blob: Blob) {
-  return new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result).split(",")[1] ?? "");
-    reader.onerror = () => reject(new Error("Could not read the recording."));
-    reader.readAsDataURL(blob);
-  });
-}
 
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 const GEMINI_NOTES_MODEL = "gemini-3.6-flash";
