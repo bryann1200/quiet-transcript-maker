@@ -62,44 +62,134 @@ function formatTime(totalSeconds: number) {
   return `${minutes}:${seconds}`;
 }
 
-function audioToBase64(blob: Blob) {
-  return new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result).split(",")[1] ?? "");
-    reader.onerror = () => reject(new Error("Could not read the recording."));
-    reader.readAsDataURL(blob);
-  });
-}
 
-function parseGeminiResult(text: string) {
-  const cleaned = text.replace(/^```json\s*/i, "").replace(/\s*```$/i, "").trim();
-  try {
-    const parsed = JSON.parse(cleaned) as { transcript?: string; notes?: string };
-    return { transcript: parsed.transcript?.trim() ?? "", notes: parsed.notes?.trim() ?? "" };
-  } catch {
-    return { transcript: text.trim(), notes: text.trim() };
+const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
+const GEMINI_NOTES_MODEL = "gemini-3.6-flash";
+const NOTES_PROMPT = `You are turning a raw recording transcript into clean, structured notes.
+
+Keep only what the main speaker actually taught, explained or decided. Remove background chatter, side conversations, small talk and off-topic tangents.
+
+Format in Markdown: a short title, clear section headers and bullet points. Keep the speaker's own terminology. Never invent details.
+
+If the recording sounds like a meeting, end with an "Action Items" section listing each item with its owner when mentioned.
+
+Transcript:
+`;
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  onRetry: (busy: boolean) => void,
+): Promise<Response> {
+  let lastResponse: Response | null = null;
+  for (let attempt = 0; attempt <= 3; attempt += 1) {
+    const response = await fetch(url, init);
+    if (response.status !== 503 && response.status !== 429) {
+      onRetry(false);
+      return response;
+    }
+    lastResponse = response;
+    if (attempt === 3) break;
+    onRetry(true);
+    await delay(1000 * 2 ** attempt);
   }
+  onRetry(false);
+  return lastResponse as Response;
 }
 
-async function processWithGemini(blob: Blob, apiKey: string) {
-  const audio = await audioToBase64(blob);
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ parts: [
-        { inlineData: { mimeType: blob.type || "audio/webm", data: audio } },
-        { text: "Transcribe this recording accurately, then create concise, useful notes. Return JSON only with exactly two string fields: transcript and notes. Format notes in readable Markdown with a short title, key points, decisions, and action items when present. Do not invent details." },
-      ] }],
-      generationConfig: { responseMimeType: "application/json" },
-    }),
-  });
-  const payload = await response.json() as { error?: { message?: string }; candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
-  if (!response.ok) throw new Error(payload.error?.message || "Gemini could not process this recording.");
-  const text = payload.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) throw new Error("Gemini returned an empty result.");
-  return parseGeminiResult(text);
+function extractText(payload: unknown): string {
+  const parts: string[] = [];
+  const walk = (value: unknown) => {
+    if (typeof value === "string") return;
+    if (Array.isArray(value)) { value.forEach(walk); return; }
+    if (value && typeof value === "object") {
+      for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+        if (key === "text" && typeof child === "string") parts.push(child);
+        else walk(child);
+      }
+    }
+  };
+  walk(payload);
+  return parts.join("\n").trim();
 }
+
+async function uploadAudioToGemini(blob: Blob, apiKey: string, onRetry: (busy: boolean) => void) {
+  const mimeType = blob.type || "audio/webm";
+  const startResponse = await fetchWithRetry("https://generativelanguage.googleapis.com/upload/v1beta/files", {
+    method: "POST",
+    headers: {
+      "x-goog-api-key": apiKey,
+      "X-Goog-Upload-Protocol": "resumable",
+      "X-Goog-Upload-Command": "start",
+      "X-Goog-Upload-Header-Content-Length": String(blob.size),
+      "X-Goog-Upload-Header-Content-Type": mimeType,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ file: { display_name: "smork-recording" } }),
+  }, onRetry);
+  if (!startResponse.ok) {
+    const detail = await startResponse.text();
+    throw new Error(`Could not start the audio upload. ${detail.slice(0, 200)}`);
+  }
+  const uploadUrl = startResponse.headers.get("x-goog-upload-url") ?? startResponse.headers.get("X-Goog-Upload-URL");
+  if (!uploadUrl) throw new Error("Gemini did not return an upload location for the audio.");
+
+  const uploadResponse = await fetchWithRetry(uploadUrl, {
+    method: "POST",
+    headers: {
+      "x-goog-api-key": apiKey,
+      "Content-Length": String(blob.size),
+      "X-Goog-Upload-Offset": "0",
+      "X-Goog-Upload-Command": "upload, finalize",
+    },
+    body: blob,
+  }, onRetry);
+  const uploadPayload = await uploadResponse.json() as { error?: { message?: string }; file?: { uri?: string; mimeType?: string } };
+  if (!uploadResponse.ok || !uploadPayload.file?.uri) {
+    throw new Error(uploadPayload.error?.message || "Uploading the recording to Gemini failed.");
+  }
+  return { fileUri: uploadPayload.file.uri, mimeType: uploadPayload.file.mimeType || mimeType };
+}
+
+async function processWithGemini(blob: Blob, apiKey: string, onRetry: (busy: boolean) => void) {
+  const { fileUri, mimeType } = await uploadAudioToGemini(blob, apiKey, onRetry);
+
+  const transcriptResponse = await fetchWithRetry("https://generativelanguage.googleapis.com/v1beta/interactions", {
+    method: "POST",
+    headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: GEMINI_TRANSCRIBE_MODEL,
+      input: [
+        {
+          role: "user",
+          parts: [
+            { fileData: { mimeType, fileUri } },
+            { text: "Transcribe this audio accurately and completely. Return the transcript text only." },
+          ],
+        },
+      ],
+    }),
+  }, onRetry);
+  const transcriptPayload = await transcriptResponse.json() as { error?: { message?: string } };
+  if (!transcriptResponse.ok) throw new Error(transcriptPayload.error?.message || "Gemini could not transcribe this recording.");
+  const transcript = extractText(transcriptPayload);
+  if (!transcript) throw new Error("Gemini returned an empty transcript.");
+
+  const notesResponse = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_NOTES_MODEL}:generateContent`, {
+    method: "POST",
+    headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: `${NOTES_PROMPT}${transcript}` }] }],
+    }),
+  }, onRetry);
+  const notesPayload = await notesResponse.json() as { error?: { message?: string }; candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+  if (!notesResponse.ok) throw new Error(notesPayload.error?.message || "Gemini could not create notes.");
+  const notes = notesPayload.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("").trim();
+  return { transcript, notes: notes || "No notes were generated." };
+}
+
 
 async function processWithGroq(blob: Blob, apiKey: string) {
   const form = new FormData();
@@ -136,6 +226,8 @@ function Smork() {
   const [history, setHistory] = useState<Session[]>([]);
   const [recording, setRecording] = useState(false);
   const [processing, setProcessing] = useState(false);
+  const [busyRetry, setBusyRetry] = useState(false);
+
   const [seconds, setSeconds] = useState(0);
   const [liveCaption, setLiveCaption] = useState("");
   const [current, setCurrent] = useState<Session | null>(null);
@@ -247,7 +339,7 @@ function Smork() {
     }
     try {
       const result = engine === "gemini"
-        ? await processWithGemini(blob, keys.gemini)
+        ? await processWithGemini(blob, keys.gemini, setBusyRetry)
         : await processWithGroq(blob, keys.groq);
       const session: Session = {
         id: crypto.randomUUID(),
@@ -262,6 +354,7 @@ function Smork() {
       setError(caught instanceof Error ? caught.message : "Something went wrong while processing the recording.");
     } finally {
       setProcessing(false);
+      setBusyRetry(false);
     }
   };
 
@@ -310,7 +403,7 @@ function Smork() {
               </button>
             </div>
             <p className="mt-7 font-display text-4xl tabular-nums tracking-normal">{formatTime(seconds)}</p>
-            <p className="mt-2 text-sm text-muted-foreground">{processing ? "Creating your Smart Notes…" : recording ? "Recording — tap to stop" : "Tap to start recording"}</p>
+            <p className="mt-2 text-sm text-muted-foreground">{busyRetry ? "Model is busy, retrying…" : processing ? "Creating your Smart Notes…" : recording ? "Recording — tap to stop" : "Tap to start recording"}</p>
             {recording && (
               <div className="mt-10 w-full max-w-xl text-left">
                 <p className="mb-3 text-xs font-medium uppercase tracking-widest text-muted-foreground">Live preview</p>
