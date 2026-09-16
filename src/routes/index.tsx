@@ -403,7 +403,7 @@ function Smork() {
               </button>
             </div>
             <p className="mt-7 font-display text-4xl tabular-nums tracking-normal">{formatTime(seconds)}</p>
-            <p className="mt-2 text-sm text-muted-foreground">{processing ? "Creating your Smart Notes…" : recording ? "Recording — tap to stop" : "Tap to start recording"}</p>
+            <p className="mt-2 text-sm text-muted-foreground">{busyRetry ? "Model is busy, retrying…" : processing ? "Creating your Smart Notes…" : recording ? "Recording — tap to stop" : "Tap to start recording"}</p>
             {recording && (
               <div className="mt-10 w-full max-w-xl text-left">
                 <p className="mb-3 text-xs font-medium uppercase tracking-widest text-muted-foreground">Live preview</p>
