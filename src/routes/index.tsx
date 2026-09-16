@@ -339,7 +339,7 @@ function Smork() {
     }
     try {
       const result = engine === "gemini"
-        ? await processWithGemini(blob, keys.gemini)
+        ? await processWithGemini(blob, keys.gemini, setBusyRetry)
         : await processWithGroq(blob, keys.groq);
       const session: Session = {
         id: crypto.randomUUID(),
