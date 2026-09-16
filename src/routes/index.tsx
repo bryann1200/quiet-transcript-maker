@@ -354,6 +354,7 @@ function Smork() {
       setError(caught instanceof Error ? caught.message : "Something went wrong while processing the recording.");
     } finally {
       setProcessing(false);
+      setBusyRetry(false);
     }
   };
 
