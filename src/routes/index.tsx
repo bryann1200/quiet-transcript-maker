@@ -226,6 +226,8 @@ function Smork() {
   const [history, setHistory] = useState<Session[]>([]);
   const [recording, setRecording] = useState(false);
   const [processing, setProcessing] = useState(false);
+  const [busyRetry, setBusyRetry] = useState(false);
+
   const [seconds, setSeconds] = useState(0);
   const [liveCaption, setLiveCaption] = useState("");
   const [current, setCurrent] = useState<Session | null>(null);
