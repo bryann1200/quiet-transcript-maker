@@ -162,14 +162,14 @@ async function processWithGemini(blob: Blob, apiKey: string, onRetry: (busy: boo
     body: JSON.stringify({
       model: GEMINI_TRANSCRIBE_MODEL,
       input: [
-        {
-          role: "user",
-          parts: [
-            { fileData: { mimeType, fileUri } },
-            { text: "Transcribe this audio accurately and completely. Return the transcript text only." },
-          ],
-        },
+        { type: "audio", uri: fileUri, mime_type: mimeType },
       ],
+      generation_config: {
+        transcription_config: {
+          language_codes: [],
+          mode: { type: "smart" },
+        },
+      },
     }),
   }, onRetry);
   const transcriptPayload = await transcriptResponse.json() as { error?: { message?: string } };
