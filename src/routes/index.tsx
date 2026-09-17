@@ -6,6 +6,7 @@ import {
   LoaderCircle,
   Mic,
   Plus,
+  RotateCcw,
   Settings2,
   Square,
   Trash2,
@@ -20,35 +21,16 @@ type Session = {
   transcript: string;
   notes: string;
 };
-type SpeechRecognitionLike = {
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  start: () => void;
-  stop: () => void;
-  onresult: ((event: { results: ArrayLike<{ 0: { transcript: string }; isFinal: boolean }> }) => void) | null;
-  onend: (() => void) | null;
-  onerror: (() => void) | null;
-};
-type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
-
-declare global {
-  interface Window {
-    SpeechRecognition?: SpeechRecognitionConstructor;
-    webkitSpeechRecognition?: SpeechRecognitionConstructor;
-  }
-}
-
 const HISTORY_KEY = "smork-history-v1";
 const SETTINGS_KEY = "smork-settings-v1";
 
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "Smork — Record less. Remember more." },
-      { name: "description", content: "Record lectures and meetings, then turn them into clear AI transcripts and Smart Notes." },
-      { property: "og:title", content: "Smork — Record less. Remember more." },
-      { property: "og:description", content: "Record lectures and meetings, then turn them into clear AI transcripts and Smart Notes." },
+      { title: "Bryan’s super duper smart note taker" },
+      { name: "description", content: "Bryan’s playful recorder for clear AI transcripts and polished Smart Notes." },
+      { property: "og:title", content: "Bryan’s super duper smart note taker" },
+      { property: "og:description", content: "Bryan’s playful recorder for clear AI transcripts and polished Smart Notes." },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
     ],
@@ -229,15 +211,15 @@ function Smork() {
   const [busyRetry, setBusyRetry] = useState(false);
 
   const [seconds, setSeconds] = useState(0);
-  const [liveCaption, setLiveCaption] = useState("");
   const [current, setCurrent] = useState<Session | null>(null);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState<"notes" | "transcript" | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
-  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const secondsRef = useRef(0);
+  const pendingAudioRef = useRef<Blob | null>(null);
+  const pendingDurationRef = useRef(0);
 
   useEffect(() => {
     try {
@@ -271,7 +253,8 @@ function Smork() {
     setCurrent(null);
     setSeconds(0);
     secondsRef.current = 0;
-    setLiveCaption("");
+    pendingAudioRef.current = null;
+    pendingDurationRef.current = 0;
     setError("");
   };
 
@@ -292,46 +275,42 @@ function Smork() {
       setCurrent(null);
       setSeconds(0);
       secondsRef.current = 0;
-      setLiveCaption("");
+      pendingAudioRef.current = null;
+      pendingDurationRef.current = 0;
       const preferred = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/mp4";
       const recorder = new MediaRecorder(stream, { mimeType: preferred });
       recorderRef.current = recorder;
       recorder.ondataavailable = (event) => { if (event.data.size) chunksRef.current.push(event.data); };
-      recorder.onstop = () => void finishRecording(new Blob(chunksRef.current, { type: preferred }));
+      recorder.onstop = () => {
+        const blob = new Blob(chunksRef.current, { type: preferred });
+        pendingAudioRef.current = blob;
+        pendingDurationRef.current = secondsRef.current;
+        void processRecording(blob, secondsRef.current);
+      };
       recorder.start();
       setRecording(true);
 
-      const Recognition = window.SpeechRecognition ?? window.webkitSpeechRecognition;
-      if (Recognition) {
-        const recognition = new Recognition();
-        recognition.continuous = true;
-        recognition.interimResults = true;
-        recognition.lang = "en-US";
-        recognition.onresult = (event) => {
-          let text = "";
-          for (let i = 0; i < event.results.length; i += 1) text += `${event.results[i]?.[0]?.transcript ?? ""} `;
-          setLiveCaption(text.trim());
-        };
-        recognition.onerror = () => {};
-        recognition.start();
-        recognitionRef.current = recognition;
-      }
     } catch {
       setError("Microphone access is needed to record. Check your browser permission and try again.");
     }
   };
 
   const stopRecording = () => {
-    recognitionRef.current?.stop();
-    recognitionRef.current = null;
     recorderRef.current?.stop();
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     setRecording(false);
-    setProcessing(true);
   };
 
-  const finishRecording = async (blob: Blob) => {
+  const processRecording = async (blob: Blob, duration: number) => {
+    if (processing) return;
+    const apiKey = keys[engine].trim();
+    if (!apiKey) {
+      setError(`Add your ${engine === "gemini" ? "Gemini" : "Groq"} API key in Settings, then retry.`);
+      return;
+    }
+    setError("");
+    setProcessing(true);
     if (blob.size < 2048) {
       setProcessing(false);
       setError("That recording was empty. Please try again.");
@@ -344,11 +323,13 @@ function Smork() {
       const session: Session = {
         id: crypto.randomUUID(),
         createdAt: new Date().toISOString(),
-        duration: secondsRef.current,
+        duration,
         transcript: result.transcript,
         notes: result.notes,
       };
       setCurrent(session);
+      pendingAudioRef.current = null;
+      pendingDurationRef.current = 0;
       saveHistory([session, ...history].slice(0, 50));
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Something went wrong while processing the recording.");
@@ -358,6 +339,12 @@ function Smork() {
     }
   };
 
+  const retryProcessing = () => {
+    const pendingAudio = pendingAudioRef.current;
+    if (!pendingAudio || processing) return;
+    void processRecording(pendingAudio, pendingDurationRef.current);
+  };
+
   const copyText = async (kind: "notes" | "transcript", text: string) => {
     await navigator.clipboard.writeText(text);
     setCopied(kind);
@@ -365,12 +352,15 @@ function Smork() {
   };
 
   return (
-    <main className="min-h-screen bg-background text-foreground">
-      <div className="mx-auto w-full max-w-3xl px-5 pb-20 pt-7 sm:px-8 sm:pt-10">
-        <header className="flex items-start justify-between gap-4">
-          <div>
-            <h1 className="font-display text-2xl font-semibold">Smork<span className="text-primary">.</span></h1>
-            <p className="mt-1 text-sm text-muted-foreground">Record less. Remember more.</p>
+    <main className="ocean-shell min-h-screen bg-background text-foreground">
+      <div className="sea-flower sea-flower-one" aria-hidden="true" />
+      <div className="sea-flower sea-flower-two" aria-hidden="true" />
+      <div className="relative mx-auto w-full max-w-3xl px-5 pb-20 pt-7 sm:px-8 sm:pt-10">
+        <header className="brand-header flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <p className="brand-eyebrow">Deep-sea dictation station</p>
+            <h1 className="font-display text-2xl font-black sm:text-3xl">Bryan’s super duper<br className="sm:hidden" /> smart note taker</h1>
+            <p className="mt-2 text-sm font-semibold text-muted-foreground">Record the ramble. Keep the good stuff.</p>
           </div>
           <button className="icon-button" onClick={newSession} disabled={recording} aria-label="Start a new session" title="New session">
             <Plus size={18} /><span>New</span>
@@ -396,7 +386,7 @@ function Smork() {
         </details>
 
         {!current && (
-          <section className="flex min-h-[460px] flex-col items-center justify-center py-12 text-center sm:min-h-[520px]">
+          <section className="record-stage flex min-h-[420px] flex-col items-center justify-center py-12 text-center sm:min-h-[500px]">
             <div className={`record-ring ${recording ? "is-recording" : ""}`}>
               <button className="record-button" onClick={recording ? stopRecording : startRecording} disabled={processing} aria-label={recording ? "Stop recording" : "Start recording"}>
                 {processing ? <LoaderCircle className="animate-spin" size={30} /> : recording ? <Square fill="currentColor" size={26} /> : <Mic size={31} />}
@@ -404,13 +394,16 @@ function Smork() {
             </div>
             <p className="mt-7 font-display text-4xl tabular-nums tracking-normal">{formatTime(seconds)}</p>
             <p className="mt-2 text-sm text-muted-foreground">{busyRetry ? "Model is busy, retrying…" : processing ? "Creating your Smart Notes…" : recording ? "Recording — tap to stop" : "Tap to start recording"}</p>
-            {recording && (
-              <div className="mt-10 w-full max-w-xl text-left">
-                <p className="mb-3 text-xs font-medium uppercase tracking-widest text-muted-foreground">Live preview</p>
-                <div className="live-preview">{liveCaption || "Listening… rough captions will appear here."}</div>
+            {error && (
+              <div className="error-message" role="alert">
+                <p>{error}</p>
+                {pendingAudioRef.current && !processing && (
+                  <button className="retry-button" onClick={retryProcessing}>
+                    <RotateCcw size={16} /> Retry with saved audio
+                  </button>
+                )}
               </div>
             )}
-            {error && <div role="alert" className="error-message">{error}</div>}
           </section>
         )}
 
